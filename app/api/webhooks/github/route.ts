@@ -1,137 +1,188 @@
 import { NextRequest, NextResponse } from "next/server";
 import crypto from "crypto";
-import { Redis } from "@upstash/redis";
+import { z } from "zod";
+import { Pool } from "pg";
+import Anthropic from "@anthropic-ai/sdk";
 
-export const dynamic = "force-dynamic";
+const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
-const redis = new Redis({
-  url: process.env.UPSTASH_REDIS_REST_URL!,
-  token: process.env.UPSTASH_REDIS_REST_TOKEN!,
+const webhookSchema = z.object({
+  action: z.string(),
+  pull_request: z
+    .object({
+      number: z.number(),
+      title: z.string(),
+      body: z.string().nullable(),
+      html_url: z.string(),
+      diff_url: z.string(),
+      state: z.string(),
+      user: z.object({ login: z.string() }),
+      base: z.object({
+        repo: z.object({ full_name: z.string(), id: z.number() }),
+      }),
+    })
+    .optional(),
+  repository: z.object({ id: z.number(), full_name: z.string() }).optional(),
 });
 
 function verifySignature(
-  payload: Buffer,
+  payload: string,
   signature: string,
   secret: string,
 ): boolean {
   const hmac = crypto.createHmac("sha256", secret);
-  hmac.update(payload);
-  const digest = `sha256=${hmac.digest("hex")}`;
+  hmac.update(payload, "utf8");
+  const digest = Buffer.from("sha256=" + hmac.digest("hex"), "utf8");
+  const sig = Buffer.from(signature, "utf8");
 
-  if (digest.length !== signature.length) {
-    const maxLength = Math.max(digest.length, signature.length);
-    const paddedDigest = digest.padEnd(maxLength, "\0");
-    const paddedSignature = signature.padEnd(maxLength, "\0");
-    try {
-      return crypto.timingSafeEqual(
-        Buffer.from(paddedDigest),
-        Buffer.from(paddedSignature),
-      );
-    } catch {
-      return false;
-    }
-  }
-
-  try {
-    return crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(signature));
-  } catch {
+  if (digest.length !== sig.length) {
     return false;
   }
+
+  return crypto.timingSafeEqual(digest, sig);
 }
 
-export async function POST(request: NextRequest): Promise<NextResponse> {
-  const secret = process.env.GITHUB_WEBHOOK_SECRET;
+async function analyzeWithClaude(pr: {
+  title: string;
+  body: string | null;
+  diff: string;
+}): Promise<string> {
+  const message = await anthropic.messages.create({
+    model: "claude-opus-4-5",
+    max_tokens: 1024,
+    messages: [
+      {
+        role: "user",
+        content: `Analyze this pull request and provide a concise code review summary:
 
-  if (!secret) {
-    console.error("GITHUB_WEBHOOK_SECRET is not configured");
-    return NextResponse.json(
-      { error: "Server configuration error" },
-      { status: 500 },
-    );
+Title: ${pr.title}
+Description: ${pr.body || "No description provided"}
+
+Diff:
+${pr.diff.slice(0, 8000)}
+
+Please provide:
+1. A brief summary of the changes
+2. Potential issues or concerns
+3. Suggestions for improvement`,
+      },
+    ],
+  });
+
+  const content = message.content[0];
+  if (content.type !== "text") {
+    throw new Error("Unexpected response type from Claude");
   }
+  return content.text;
+}
 
-  const signature = request.headers.get("x-hub-signature-256");
+export async function POST(req: NextRequest): Promise<NextResponse> {
+  const rawBody = await req.text();
+  const signature = req.headers.get("x-hub-signature-256");
+  const event = req.headers.get("x-github-event");
 
   if (!signature) {
     return NextResponse.json({ error: "Missing signature" }, { status: 401 });
   }
 
-  const rawBody = await request.arrayBuffer();
-  const bodyBuffer = Buffer.from(rawBody);
-
-  const isValid = verifySignature(bodyBuffer, signature, secret);
-
-  if (!isValid) {
-    return NextResponse.json({ error: "Invalid signature" }, { status: 401 });
-  }
-
-  const eventType = request.headers.get("x-github-event");
-
-  if (eventType !== "pull_request") {
-    return NextResponse.json({ message: "Event ignored" }, { status: 200 });
-  }
-
-  let payload: Record<string, unknown>;
-  try {
-    const bodyText = bodyBuffer.toString("utf-8");
-    payload = JSON.parse(bodyText);
-  } catch {
+  const webhookSecret = process.env.GITHUB_WEBHOOK_SECRET;
+  if (!webhookSecret) {
     return NextResponse.json(
-      { error: "Invalid JSON payload" },
-      { status: 400 },
-    );
-  }
-
-  const action = payload.action as string;
-  const handledActions = ["opened", "synchronize", "reopened"];
-
-  if (!handledActions.includes(action)) {
-    return NextResponse.json({ message: "Action ignored" }, { status: 200 });
-  }
-
-  const pullRequest = payload.pull_request as
-    | Record<string, unknown>
-    | undefined;
-  const repository = payload.repository as Record<string, unknown> | undefined;
-
-  if (!pullRequest || !repository) {
-    return NextResponse.json(
-      { error: "Invalid payload structure" },
-      { status: 400 },
-    );
-  }
-
-  const repositoryFullName = repository.full_name as string;
-  const prNumber = pullRequest.number as number;
-  const head = pullRequest.head as Record<string, unknown> | undefined;
-  const sha = head?.sha as string;
-
-  if (!repositoryFullName || !prNumber || !sha) {
-    return NextResponse.json(
-      { error: "Missing required payload fields" },
-      { status: 400 },
-    );
-  }
-
-  const job = {
-    repositoryFullName,
-    prNumber,
-    sha,
-    action,
-  };
-
-  try {
-    await redis.lpush("pr-analysis-queue", JSON.stringify(job));
-  } catch (error) {
-    console.error("Failed to enqueue job to Redis:", error);
-    return NextResponse.json(
-      { error: "Failed to enqueue job" },
+      { error: "Webhook secret not configured" },
       { status: 500 },
     );
   }
 
-  return NextResponse.json(
-    { message: "Job enqueued successfully" },
-    { status: 200 },
-  );
+  if (!verifySignature(rawBody, signature, webhookSecret)) {
+    return NextResponse.json({ error: "Invalid signature" }, { status: 401 });
+  }
+
+  if (event !== "pull_request") {
+    return NextResponse.json({ message: "Event ignored" }, { status: 200 });
+  }
+
+  let payload: unknown;
+  try {
+    payload = JSON.parse(rawBody);
+  } catch {
+    return NextResponse.json({ error: "Invalid JSON" }, { status: 400 });
+  }
+
+  const parsed = webhookSchema.safeParse(payload);
+  if (!parsed.success) {
+    return NextResponse.json(
+      { error: "Invalid payload", details: parsed.error.flatten() },
+      { status: 400 },
+    );
+  }
+
+  const data = parsed.data;
+
+  if (
+    !data.pull_request ||
+    !["opened", "synchronize", "reopened"].includes(data.action)
+  ) {
+    return NextResponse.json({ message: "Action ignored" }, { status: 200 });
+  }
+
+  const pr = data.pull_request;
+  const repoGithubId = pr.base.repo.id;
+
+  const client = await pool.connect();
+  try {
+    const repoResult = await client.query(
+      "SELECT id, webhook_secret FROM repositories WHERE github_id = $1",
+      [repoGithubId],
+    );
+
+    if (repoResult.rows.length === 0) {
+      return NextResponse.json(
+        { error: "Repository not found" },
+        { status: 404 },
+      );
+    }
+
+    const repository = repoResult.rows[0];
+
+    let diff = "";
+    try {
+      const diffResponse = await fetch(pr.diff_url, {
+        headers: { Accept: "application/vnd.github.v3.diff" },
+      });
+      if (diffResponse.ok) {
+        diff = await diffResponse.text();
+      }
+    } catch {
+      diff = "Diff unavailable";
+    }
+
+    const analysis = await analyzeWithClaude({
+      title: pr.title,
+      body: pr.body,
+      diff,
+    });
+
+    await client.query(
+      `INSERT INTO pr_analyses (repository_id, pr_number, pr_title, pr_url, pr_author, analysis, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, NOW())
+       ON CONFLICT (repository_id, pr_number) DO UPDATE
+       SET analysis = EXCLUDED.analysis, pr_title = EXCLUDED.pr_title, created_at = NOW()`,
+      [
+        repository.id,
+        pr.number,
+        pr.title,
+        pr.html_url,
+        pr.user.login,
+        analysis,
+      ],
+    );
+
+    return NextResponse.json(
+      { message: "PR analyzed successfully" },
+      { status: 200 },
+    );
+  } finally {
+    client.release();
+  }
 }
