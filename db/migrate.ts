@@ -1,141 +1,124 @@
-import { Client } from "pg";
+import { Pool } from "pg";
 
-const client = new Client({
+const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
 });
 
 async function migrate() {
-  await client.connect();
+  const client = await pool.connect();
 
   try {
     await client.query("BEGIN");
 
     await client.query(`
-      CREATE TABLE IF NOT EXISTS organizations (
-        id SERIAL PRIMARY KEY,
-        github_org_id BIGINT NOT NULL UNIQUE,
-        name VARCHAR(255) NOT NULL,
-        created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
-      )
-    `);
-
-    await client.query(`
       CREATE TABLE IF NOT EXISTS users (
         id SERIAL PRIMARY KEY,
-        github_user_id BIGINT NOT NULL UNIQUE,
-        email VARCHAR(255),
         name VARCHAR(255),
-        avatar_url TEXT,
+        email VARCHAR(255) UNIQUE NOT NULL,
+        email_verified TIMESTAMPTZ,
+        image TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+    `);
+
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS accounts (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        type VARCHAR(255) NOT NULL,
+        provider VARCHAR(255) NOT NULL,
+        provider_account_id VARCHAR(255) NOT NULL,
+        refresh_token TEXT,
         access_token TEXT,
-        created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
-      )
+        expires_at BIGINT,
+        token_type VARCHAR(255),
+        scope TEXT,
+        id_token TEXT,
+        session_state TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        UNIQUE(provider, provider_account_id)
+      );
     `);
 
     await client.query(`
-      CREATE TABLE IF NOT EXISTS repositories (
+      CREATE TABLE IF NOT EXISTS sessions (
         id SERIAL PRIMARY KEY,
-        org_id INTEGER REFERENCES organizations(id) ON DELETE SET NULL,
-        owner_github_user_id BIGINT,
-        github_repo_id BIGINT NOT NULL UNIQUE,
-        full_name VARCHAR(512) NOT NULL,
-        name VARCHAR(255) NOT NULL,
-        score_threshold NUMERIC(5, 2) NOT NULL DEFAULT 70.00,
-        webhook_secret TEXT,
-        created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
-      )
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        session_token VARCHAR(255) UNIQUE NOT NULL,
+        expires TIMESTAMPTZ NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
     `);
 
     await client.query(`
-      CREATE TABLE IF NOT EXISTS pr_analyses (
+      CREATE TABLE IF NOT EXISTS verification_tokens (
+        identifier VARCHAR(255) NOT NULL,
+        token VARCHAR(255) UNIQUE NOT NULL,
+        expires TIMESTAMPTZ NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        PRIMARY KEY (identifier, token)
+      );
+    `);
+
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS conversations (
         id SERIAL PRIMARY KEY,
-        repository_id INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,
-        pr_number INTEGER NOT NULL,
-        pr_title TEXT,
-        sha VARCHAR(40) NOT NULL,
-        merge_score NUMERIC(5, 2),
-        untested_paths JSONB,
-        test_suggestions TEXT,
-        raw_llm_response TEXT,
-        status VARCHAR(50) NOT NULL DEFAULT 'pending',
-        created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
-        updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
-      )
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        title VARCHAR(500),
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
     `);
 
     await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_pr_analyses_repository_id ON pr_analyses(repository_id)
-    `);
-
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_pr_analyses_repository_pr ON pr_analyses(repository_id, pr_number)
-    `);
-
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS analysis_jobs (
+      CREATE TABLE IF NOT EXISTS messages (
         id SERIAL PRIMARY KEY,
-        repository_id INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,
-        pr_number INTEGER NOT NULL,
-        sha VARCHAR(40) NOT NULL,
-        status VARCHAR(50) NOT NULL DEFAULT 'queued',
-        error_message TEXT,
-        created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
-        updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
-      )
+        conversation_id INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+        role VARCHAR(50) NOT NULL CHECK (role IN ('user', 'assistant', 'system')),
+        content TEXT NOT NULL,
+        input_tokens INTEGER,
+        output_tokens INTEGER,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
     `);
 
     await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_analysis_jobs_repository_id ON analysis_jobs(repository_id)
+      CREATE INDEX IF NOT EXISTS idx_accounts_user_id ON accounts(user_id);
     `);
 
     await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_analysis_jobs_status ON analysis_jobs(status)
+      CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id);
     `);
 
     await client.query(`
-      CREATE OR REPLACE FUNCTION update_updated_at_column()
-      RETURNS TRIGGER AS $$
-      BEGIN
-        NEW.updated_at = NOW();
-        RETURN NEW;
-      END;
-      $$ language 'plpgsql'
+      CREATE INDEX IF NOT EXISTS idx_sessions_session_token ON sessions(session_token);
     `);
 
     await client.query(`
-      DROP TRIGGER IF EXISTS update_pr_analyses_updated_at ON pr_analyses
+      CREATE INDEX IF NOT EXISTS idx_conversations_user_id ON conversations(user_id);
     `);
 
     await client.query(`
-      CREATE TRIGGER update_pr_analyses_updated_at
-        BEFORE UPDATE ON pr_analyses
-        FOR EACH ROW
-        EXECUTE FUNCTION update_updated_at_column()
-    `);
-
-    await client.query(`
-      DROP TRIGGER IF EXISTS update_analysis_jobs_updated_at ON analysis_jobs
-    `);
-
-    await client.query(`
-      CREATE TRIGGER update_analysis_jobs_updated_at
-        BEFORE UPDATE ON analysis_jobs
-        FOR EACH ROW
-        EXECUTE FUNCTION update_updated_at_column()
+      CREATE INDEX IF NOT EXISTS idx_messages_conversation_id ON messages(conversation_id);
     `);
 
     await client.query("COMMIT");
 
-    console.log("Migration completed successfully.");
+    console.log("Migration completed successfully");
   } catch (error) {
     await client.query("ROLLBACK");
-    console.error("Migration failed, rolling back:", error);
+    console.error("Migration failed:", error);
     throw error;
   } finally {
-    await client.end();
+    client.release();
+    await pool.end();
   }
 }
 
 migrate().catch((error) => {
-  console.error("Unhandled migration error:", error);
+  console.error("Fatal migration error:", error);
   process.exit(1);
 });
