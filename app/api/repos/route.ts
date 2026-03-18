@@ -1,46 +1,34 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getServerSession } from "next-auth";
+import { authOptions } from "@/lib/auth";
+import { query } from "@/lib/db";
 import { z } from "zod";
-import { Pool } from "pg";
-
-export const dynamic = "force-dynamic";
-
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-});
 
 const createRepoSchema = z.object({
   owner: z.string().min(1),
   name: z.string().min(1),
+  webhook_id: z.number().optional(),
 });
 
-export async function GET(request: NextRequest) {
-  const session = await getServerSession();
-
-  if (!session || !session.user?.email) {
+export async function GET(req: NextRequest) {
+  const session = await getServerSession(authOptions);
+  if (!session?.user?.id) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
-  const client = await pool.connect();
   try {
-    const userResult = await client.query(
-      "SELECT id, org_id FROM users WHERE email = $1",
-      [session.user.email],
-    );
+    const userResult = await query("SELECT org_id FROM users WHERE id = $1", [
+      session.user.id,
+    ]);
 
     if (userResult.rows.length === 0) {
       return NextResponse.json({ error: "User not found" }, { status: 404 });
     }
 
-    const user = userResult.rows[0];
-    const orgId = user.org_id;
+    const orgId = userResult.rows[0].org_id;
 
-    if (!orgId) {
-      return NextResponse.json({ repos: [] });
-    }
-
-    const reposResult = await client.query(
-      "SELECT id, owner, name, webhook_id, created_at, updated_at FROM repos WHERE org_id = $1 ORDER BY created_at DESC",
+    const reposResult = await query(
+      "SELECT * FROM repos WHERE org_id = $1 ORDER BY created_at DESC",
       [orgId],
     );
 
@@ -51,136 +39,115 @@ export async function GET(request: NextRequest) {
       { error: "Internal server error" },
       { status: 500 },
     );
-  } finally {
-    client.release();
   }
 }
 
-export async function POST(request: NextRequest) {
-  const session = await getServerSession();
-
-  if (!session || !session.user?.email) {
+export async function POST(req: NextRequest) {
+  const session = await getServerSession(authOptions);
+  if (!session?.user?.id) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
   let body: unknown;
   try {
-    body = await request.json();
+    body = await req.json();
   } catch {
-    return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
+    return NextResponse.json({ error: "Invalid JSON" }, { status: 400 });
   }
 
-  const parseResult = createRepoSchema.safeParse(body);
-  if (!parseResult.success) {
+  const parsed = createRepoSchema.safeParse(body);
+  if (!parsed.success) {
     return NextResponse.json(
-      { error: "Validation failed", details: parseResult.error.flatten() },
+      { error: "Validation failed", details: parsed.error.errors },
       { status: 400 },
     );
   }
 
-  const { owner, name } = parseResult.data;
+  const { owner, name, webhook_id } = parsed.data;
 
-  const client = await pool.connect();
   try {
-    const userResult = await client.query(
-      "SELECT id, org_id FROM users WHERE email = $1",
-      [session.user.email],
-    );
+    const userResult = await query("SELECT org_id FROM users WHERE id = $1", [
+      session.user.id,
+    ]);
 
     if (userResult.rows.length === 0) {
       return NextResponse.json({ error: "User not found" }, { status: 404 });
     }
 
-    const user = userResult.rows[0];
-    const orgId = user.org_id;
+    const orgId = userResult.rows[0].org_id;
 
-    if (!orgId) {
+    // Fetch repository details from GitHub API to obtain github_repo_id
+    const githubToken = session.user.githubAccessToken;
+    const githubApiUrl = `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(name)}`;
+
+    const githubHeaders: Record<string, string> = {
+      Accept: "application/vnd.github+json",
+      "X-GitHub-Api-Version": "2022-11-28",
+    };
+
+    if (githubToken) {
+      githubHeaders["Authorization"] = `Bearer ${githubToken}`;
+    }
+
+    const githubResponse = await fetch(githubApiUrl, {
+      headers: githubHeaders,
+    });
+
+    if (!githubResponse.ok) {
+      if (githubResponse.status === 404) {
+        return NextResponse.json(
+          { error: "Repository not found on GitHub" },
+          { status: 404 },
+        );
+      }
+      if (githubResponse.status === 403 || githubResponse.status === 401) {
+        return NextResponse.json(
+          { error: "GitHub API access denied" },
+          { status: 403 },
+        );
+      }
       return NextResponse.json(
-        { error: "User does not belong to an organization" },
-        { status: 400 },
+        { error: "Failed to fetch repository details from GitHub" },
+        { status: 502 },
       );
     }
 
-    const existingRepo = await client.query(
-      "SELECT id FROM repos WHERE owner = $1 AND name = $2 AND org_id = $3",
-      [owner, name, orgId],
+    const githubRepo = await githubResponse.json();
+    const githubRepoId: number = githubRepo.id;
+
+    if (!githubRepoId) {
+      return NextResponse.json(
+        { error: "Could not retrieve github_repo_id from GitHub API" },
+        { status: 502 },
+      );
+    }
+
+    // Check for duplicate
+    const existingRepo = await query(
+      "SELECT id FROM repos WHERE github_repo_id = $1",
+      [githubRepoId],
     );
 
     if (existingRepo.rows.length > 0) {
       return NextResponse.json(
-        { error: "Repository already exists for this organization" },
+        { error: "Repository already exists" },
         { status: 409 },
       );
     }
 
-    const githubToken = process.env.GITHUB_TOKEN;
-    if (!githubToken) {
-      return NextResponse.json(
-        { error: "GitHub token not configured" },
-        { status: 500 },
-      );
-    }
-
-    const webhookUrl =
-      process.env.WEBHOOK_URL ||
-      `${process.env.NEXTAUTH_URL}/api/webhooks/github`;
-
-    const githubResponse = await fetch(
-      `https://api.github.com/repos/${owner}/${name}/hooks`,
-      {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${githubToken}`,
-          Accept: "application/vnd.github+json",
-          "Content-Type": "application/json",
-          "X-GitHub-Api-Version": "2022-11-28",
-        },
-        body: JSON.stringify({
-          name: "web",
-          active: true,
-          events: ["push", "pull_request"],
-          config: {
-            url: webhookUrl,
-            content_type: "json",
-            insecure_ssl: "0",
-            secret: process.env.GITHUB_WEBHOOK_SECRET || "",
-          },
-        }),
-      },
+    const insertResult = await query(
+      `INSERT INTO repos (owner, name, github_repo_id, webhook_id, org_id, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
+       RETURNING *`,
+      [owner, name, githubRepoId, webhook_id ?? null, orgId],
     );
 
-    if (!githubResponse.ok) {
-      const errorData = await githubResponse.json().catch(() => ({}));
-      console.error("GitHub API error:", githubResponse.status, errorData);
-      return NextResponse.json(
-        {
-          error: "Failed to create GitHub webhook",
-          details: errorData,
-        },
-        { status: githubResponse.status },
-      );
-    }
-
-    const webhookData = await githubResponse.json();
-    const webhookId = webhookData.id;
-
-    const insertResult = await client.query(
-      `INSERT INTO repos (owner, name, webhook_id, org_id, created_at, updated_at)
-       VALUES ($1, $2, $3, $4, NOW(), NOW())
-       RETURNING id, owner, name, webhook_id, org_id, created_at, updated_at`,
-      [owner, name, webhookId, orgId],
-    );
-
-    const newRepo = insertResult.rows[0];
-
-    return NextResponse.json({ repo: newRepo }, { status: 201 });
+    return NextResponse.json({ repo: insertResult.rows[0] }, { status: 201 });
   } catch (error) {
     console.error("Error creating repo:", error);
     return NextResponse.json(
       { error: "Internal server error" },
       { status: 500 },
     );
-  } finally {
-    client.release();
   }
 }
